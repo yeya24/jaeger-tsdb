@@ -6,7 +6,7 @@ Jaeger-tsdb is a Jaeger storage plugin based on the grpc-plugin mechanism. It st
 
 This project is for fun and practise. Please don't use it in production :). Because the high cardinality data model is not suitable for Prometheus TSDB.
 
-The storage also cannot support span duration query because the limition of the Prometheus TSDB.
+The storage also cannot support span duration query because the limitation of the Prometheus TSDB.
 
 ## How to use
 
