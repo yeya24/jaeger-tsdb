@@ -51,19 +51,19 @@ const (
 )
 
 type store struct {
-	conf   *Conf
+	conf   *conf
 	tsdb   *tsdb.DB
 }
 
-type Conf struct {
+type conf struct {
 	retention   time.Duration
 	storagePath string
 }
 
 func newStore() (*store, error) {
-	c := &Conf{
-		retention:   time.Hour,
-		storagePath: "/Users/yeya24/prom/data1",
+	c := &conf{
+		retention:  2 * time.Hour,
+		storagePath: "/data",
 	}
 
 	tdb, err := tsdb.Open(
