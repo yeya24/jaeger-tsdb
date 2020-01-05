@@ -10,6 +10,8 @@ The storage also cannot support span duration query because the limitation of th
 
 ## How to use
 
+### Build From Source
+
 1. Build the plugin binary
 
 ```
@@ -20,6 +22,12 @@ GO111MODULE=on go build -o jaeger-tsdb
 
 ```
 SPAN_STORAGE_TYPE=grpc-plugin ./all-in-one --grpc-storage-plugin.binary=jaeger-tsdb
+```
+
+### Start From Docker Image
+
+```
+docker run -d -p 16686:16686 -p 6831:6831/udp -p 6832:6832/udp  yeya24/jaeger-tsdb:1.14
 ```
 
 ## Example query
