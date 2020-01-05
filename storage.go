@@ -5,13 +5,11 @@ import (
 	"errors"
 	"flag"
 	"math"
-	"path/filepath"
 	"time"
 
 	"github.com/conprof/tsdb"
 	"github.com/conprof/tsdb/labels"
 	"github.com/conprof/tsdb/wal"
-	"github.com/dgraph-io/badger"
 	"github.com/go-kit/kit/log"
 	"github.com/gogo/protobuf/proto"
 	"github.com/hashicorp/go-hclog"
@@ -55,7 +53,6 @@ const (
 type store struct {
 	conf   *Conf
 	tsdb   *tsdb.DB
-	badger *badger.DB
 }
 
 type Conf struct {
@@ -84,17 +81,11 @@ func newStore() (*store, error) {
 		logger.Warn("failed to open tsdb", "err", err)
 		return nil, err
 	}
-	db, err := badger.Open(badger.DefaultOptions(filepath.Join(*storagePath, "badger-db")))
-	if err != nil {
-		logger.Warn("failed to open badger", "err", err)
-		return nil, err
-	}
-	return &store{tsdb: tdb, badger: db, conf: c}, nil
+	return &store{tsdb: tdb, conf: c}, nil
 }
 
 func (s *store) Close() error {
-	s.tsdb.Close()
-	return s.badger.Close()
+	return s.tsdb.Close()
 }
 
 func (s *store) DependencyReader() dependencystore.Reader {
@@ -114,7 +105,37 @@ func (s *store) GetDependencies(endTs time.Time, lookback time.Duration) ([]mode
 }
 
 func (s *store) GetTrace(ctx context.Context, traceID model.TraceID) (*model.Trace, error) {
-	return getTraceFromDB(s.badger, traceID)
+	q, err := s.tsdb.Querier(0, math.MaxInt64)
+	if err != nil {
+		logger.Warn("failed to create querier", "err", err)
+		return nil, err
+	}
+	ss, err := q.Select(labels.NewEqualMatcher(traceIDLabel, traceID.String()))
+	if err != nil {
+		logger.Warn("failed to select", "err", err)
+		return nil, err
+	}
+
+	var spans []*model.Span
+	for ss.Next() {
+		series := ss.At()
+		it := series.Iterator()
+		for it.Next() {
+			_, v := it.At()
+			span, err := decodeValue(v)
+			if err != nil {
+				logger.Warn("failed to unmarshal to span", "err", err)
+				return nil, err
+			}
+			spans = append(spans, span)
+		}
+		if err := it.Err(); err != nil {
+			logger.Warn("failed to iterate series set", "err", err)
+			return nil, err
+		}
+	}
+
+	return &model.Trace{Spans: spans}, nil
 }
 
 func (s *store) GetServices(ctx context.Context) ([]string, error) {
@@ -165,50 +186,52 @@ func (s *store) GetOperations(ctx context.Context, service string) ([]string, er
 
 
 func (s *store) FindTraces(ctx context.Context, query *spanstore.TraceQueryParameters) ([]*model.Trace, error) {
-	traceIDs, err := s.findTraceIDs(ctx, query)
-	if err != nil {
-		logger.Warn("error find trace id from tsdb", "err", err)
-		return nil, err
-	}
-	logger.Warn("findID", "id", traceIDs[0].String())
-
-	return getTracesFromDB(s.badger, traceIDs)
-}
-
-func (s *store) FindTraceIDs(ctx context.Context, query *spanstore.TraceQueryParameters) ([]model.TraceID, error) {
-	return s.findTraceIDs(ctx, query)
-}
-
-func (s *store) findTraceIDs(ctx context.Context, query *spanstore.TraceQueryParameters) ([]model.TraceID, error) {
-	if err := validateQuery(query); err != nil {
-		logger.Warn("query is invalid", "err", err)
-		return nil, err
-	}
-	q, err := s.tsdb.Querier(int64(model.TimeAsEpochMicroseconds(query.StartTimeMin)), int64(model.TimeAsEpochMicroseconds(query.StartTimeMax)))
-	if err != nil {
-		logger.Warn("failed to create querier", "err", err)
-		return nil, err
-	}
-	var lbs []labels.Matcher
-	if query.OperationName != "" {
-		lbs = append(lbs, labels.NewEqualMatcher(operationLabel, query.OperationName))
-	}
-
-	if query.ServiceName != "" {
-		lbs = append(lbs, labels.NewEqualMatcher(serviceLabel, query.ServiceName))
-	}
-
-	for k, v := range query.Tags {
-		lbs = append(lbs, labels.NewEqualMatcher(k, v))
-	}
-
-	var res []model.TraceID
-	ss, err := q.Select(lbs...)
+	ss, err := s.selectTSDBWithQuery(query)
 	if err != nil {
 		logger.Warn("failed to select", "err", err)
 		return nil, err
 	}
 
+	traceMap := make(map[string]*model.Trace)
+	for ss.Next() {
+		it := ss.At().Iterator()
+		for it.Next() {
+			_, v := it.At()
+			span, err := decodeValue(v)
+			if err != nil {
+				logger.Warn("failed to unmarshal to span", "err", err)
+				return nil, err
+			}
+
+			id := span.TraceID.String()
+			if _, ok := traceMap[id]; !ok {
+				traceMap[id] = &model.Trace{Spans: []*model.Span{span}}
+			} else {
+				traceMap[id].Spans = append(traceMap[id].Spans, span)
+			}
+		}
+		if err := it.Err(); err != nil {
+			logger.Warn("failed to iterate series set", "err", err)
+			return nil, err
+		}
+	}
+
+	var res []*model.Trace
+	for _, v := range traceMap {
+		res = append(res, v)
+	}
+
+	return res, nil
+}
+
+func (s *store) FindTraceIDs(ctx context.Context, query *spanstore.TraceQueryParameters) ([]model.TraceID, error) {
+	ss, err := s.selectTSDBWithQuery(query)
+	if err != nil {
+		logger.Warn("failed to select", "err", err)
+		return nil, err
+	}
+
+	var res []model.TraceID
 	for ss.Next() {
 		series := ss.At()
 		ls := series.Labels()
@@ -225,16 +248,7 @@ func (s *store) findTraceIDs(ctx context.Context, query *spanstore.TraceQueryPar
 }
 
 func (s *store) WriteSpan(span *model.Span) error {
-	// Write to KV Store.
 	start := time.Now()
-	if err := writeSpanToDB(s.badger, span, time.Now().Add(time.Hour)); err != nil {
-		logger.Warn("error write to badger", "err", err)
-		return err
-	}
-
-	logger.Warn("write to badger", "duration", time.Since(start).String())
-
-	start = time.Now()
 	data, err := proto.Marshal(span)
 	if err != nil {
 		return err
@@ -296,4 +310,44 @@ func validateQuery(p *spanstore.TraceQueryParameters) error {
 		return ErrDurationMinGreaterThanMax
 	}
 	return nil
+}
+
+func (s *store) selectTSDBWithQuery(query *spanstore.TraceQueryParameters) (tsdb.SeriesSet, error) {
+	if err := validateQuery(query); err != nil {
+		logger.Warn("query is invalid", "err", err)
+		return nil, err
+	}
+	q, err := s.tsdb.Querier(int64(model.TimeAsEpochMicroseconds(query.StartTimeMin)), int64(model.TimeAsEpochMicroseconds(query.StartTimeMax)))
+	if err != nil {
+		logger.Warn("failed to create querier", "err", err)
+		return nil, err
+	}
+	defer q.Close()
+
+	var lbs []labels.Matcher
+	if query.OperationName != "" {
+		lbs = append(lbs, labels.NewEqualMatcher(operationLabel, query.OperationName))
+	}
+
+	if query.ServiceName != "" {
+		lbs = append(lbs, labels.NewEqualMatcher(serviceLabel, query.ServiceName))
+	}
+
+	for k, v := range query.Tags {
+		lbs = append(lbs, labels.NewEqualMatcher(k, v))
+	}
+
+	ss, err := q.Select(lbs...)
+	if err != nil {
+		return nil, err
+	}
+	return ss, nil
+}
+
+func decodeValue(val []byte) (*model.Span, error) {
+	sp := model.Span{}
+	if err := proto.Unmarshal(val, &sp); err != nil {
+		return nil, err
+	}
+	return &sp, nil
 }
